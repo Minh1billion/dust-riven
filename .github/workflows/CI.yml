@@ -30,12 +30,24 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Create virtualenv
+        shell: bash
+        run: python -m venv .venv
       - name: Install maturin and test dependencies
-        run: pip install maturin pytest pytest-asyncio
+        shell: bash
+        run: |
+          source .venv/bin/activate 2>/dev/null || source .venv/Scripts/activate
+          pip install maturin pytest pytest-asyncio
       - name: Build and install in development mode
-        run: maturin develop --release
+        shell: bash
+        run: |
+          source .venv/bin/activate 2>/dev/null || source .venv/Scripts/activate
+          maturin develop --release
       - name: Run tests
-        run: pytest
+        shell: bash
+        run: |
+          source .venv/bin/activate 2>/dev/null || source .venv/Scripts/activate
+          pytest
 
   linux:
     runs-on: ${{ matrix.platform.runner }}
