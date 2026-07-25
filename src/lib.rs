@@ -4,9 +4,14 @@ use std::sync::RwLock;
 use slotmap::{SlotMap, DefaultKey};
 use futures::stream::{FuturesUnordered, StreamExt};
 
+struct ListenerEntry {
+    callback: Py<PyAny>,
+    once: bool,
+}
+
 #[pyclass]
 struct Signal {
-    listeners: RwLock<SlotMap<DefaultKey, Py<PyAny>>>,
+    listeners: RwLock<SlotMap<DefaultKey, ListenerEntry>>,
 }
 
 #[pymethods]
@@ -19,7 +24,14 @@ impl Signal {
     }
 
     fn connect(&self, callback: Py<PyAny>) -> u64 {
-        let key = self.listeners.write().unwrap().insert(callback);
+        let entry = ListenerEntry { callback, once: false };
+        let key = self.listeners.write().unwrap().insert(entry);
+        key_to_u64(key)
+    }
+
+    fn once(&self, callback: Py<PyAny>) -> u64 {
+        let entry = ListenerEntry { callback, once: true };
+        let key = self.listeners.write().unwrap().insert(entry);
         key_to_u64(key)
     }
 
@@ -32,10 +44,7 @@ impl Signal {
     fn emit(&self, py: Python<'_>, args: Bound<'_, PyTuple>, on_error: &str) -> PyResult<()> {
         validate_on_error(on_error)?;
 
-        let snapshot: Vec<Py<PyAny>> = self.listeners.read().unwrap()
-            .values()
-            .map(|obj| obj.clone_ref(py))
-            .collect();
+        let snapshot = take_emit_snapshot(&self.listeners, py);
 
         let asyncio = py.import("asyncio")?;
         let mut first_error = None;
@@ -100,10 +109,7 @@ impl Signal {
     ) -> PyResult<Bound<'py, PyAny>> {
         validate_on_error(on_error)?;
 
-        let snapshot: Vec<Py<PyAny>> = self.listeners.read().unwrap()
-            .values()
-            .map(|obj| obj.clone_ref(py))
-            .collect();
+        let snapshot = take_emit_snapshot(&self.listeners, py);
         let args: Py<PyTuple> = args.unbind();
         let on_error = on_error.to_string();
 
@@ -180,6 +186,29 @@ impl Signal {
             }
         })
     }
+}
+
+fn take_emit_snapshot(
+    listeners: &RwLock<SlotMap<DefaultKey, ListenerEntry>>,
+    py: Python<'_>,
+) -> Vec<Py<PyAny>> {
+    let mut listeners = listeners.write().unwrap();
+    let once_keys: Vec<DefaultKey> = listeners
+        .iter()
+        .filter(|(_, entry)| entry.once)
+        .map(|(key, _)| key)
+        .collect();
+
+    let snapshot: Vec<Py<PyAny>> = listeners
+        .values()
+        .map(|entry| entry.callback.clone_ref(py))
+        .collect();
+
+    for key in once_keys {
+        listeners.remove(key);
+    }
+
+    snapshot
 }
 
 fn key_to_u64(key: DefaultKey) -> u64 {
