@@ -2,10 +2,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyTuple};
 use std::sync::RwLock;
 use slotmap::{SlotMap, DefaultKey};
+use futures::stream::{FuturesUnordered, StreamExt};
+
+struct ListenerEntry {
+    callback: Py<PyAny>,
+    once: bool,
+}
 
 #[pyclass]
 struct Signal {
-    listeners: RwLock<SlotMap<DefaultKey, Py<PyAny>>>,
+    listeners: RwLock<SlotMap<DefaultKey, ListenerEntry>>,
 }
 
 #[pymethods]
@@ -18,7 +24,14 @@ impl Signal {
     }
 
     fn connect(&self, callback: Py<PyAny>) -> u64 {
-        let key = self.listeners.write().unwrap().insert(callback);
+        let entry = ListenerEntry { callback, once: false };
+        let key = self.listeners.write().unwrap().insert(entry);
+        key_to_u64(key)
+    }
+
+    fn once(&self, callback: Py<PyAny>) -> u64 {
+        let entry = ListenerEntry { callback, once: true };
+        let key = self.listeners.write().unwrap().insert(entry);
         key_to_u64(key)
     }
 
@@ -27,12 +40,11 @@ impl Signal {
         self.listeners.write().unwrap().remove(key);
     }
 
-    #[pyo3(signature = (*args))]
-    fn emit(&self, py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<()> {
-        let snapshot: Vec<Py<PyAny>> = self.listeners.read().unwrap()
-            .values()
-            .map(|obj| obj.clone_ref(py))
-            .collect();
+    #[pyo3(signature = (*args, on_error="collect"))]
+    fn emit(&self, py: Python<'_>, args: Bound<'_, PyTuple>, on_error: &str) -> PyResult<()> {
+        validate_on_error(on_error)?;
+
+        let snapshot = take_emit_snapshot(&self.listeners, py);
 
         let asyncio = py.import("asyncio")?;
         let mut first_error = None;
@@ -60,7 +72,10 @@ impl Signal {
                              Use emit_async() for async listeners.",
                             listener_repr
                         ));
-                        err.print(py);
+
+                        if on_error == "fail_fast" {
+                            return Err(err);
+                        }
 
                         if first_error.is_none() {
                             first_error = Some(err);
@@ -68,7 +83,9 @@ impl Signal {
                     }
                 }
                 Err(e) => {
-                    e.print(py);
+                    if on_error == "fail_fast" {
+                        return Err(e);
+                    }
 
                     if first_error.is_none() {
                         first_error = Some(e);
@@ -83,23 +100,24 @@ impl Signal {
         }
     }
 
-    #[pyo3(signature = (*args))]
+    #[pyo3(signature = (*args, on_error="collect"))]
     fn emit_async<'py>(
         &self,
         py: Python<'py>,
         args: Bound<'py, PyTuple>,
+        on_error: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let snapshot: Vec<Py<PyAny>> = self.listeners.read().unwrap()
-            .values()
-            .map(|obj| obj.clone_ref(py))
-            .collect();
+        validate_on_error(on_error)?;
+
+        let snapshot = take_emit_snapshot(&self.listeners, py);
         let args: Py<PyTuple> = args.unbind();
+        let on_error = on_error.to_string();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut pending = Vec::new();
             let mut first_error: Option<PyErr> = None;
 
-            Python::attach(|py| -> PyResult<()> {
+            let dispatch_result = Python::attach(|py| -> PyResult<()> {
                 let asyncio = py.import("asyncio")?;
                 let args = args.bind(py);
 
@@ -118,7 +136,10 @@ impl Signal {
                             }
                         }
                         Err(e) => {
-                            e.print(py);
+                            if on_error == "fail_fast" {
+                                return Err(e);
+                            }
+
                             if first_error.is_none() {
                                 first_error = Some(e);
                             }
@@ -126,20 +147,38 @@ impl Signal {
                     }
                 }
                 Ok(())
-            })?;
+            });
+
+            if let Err(e) = dispatch_result {
+                return Err(e);
+            }
+
+            if on_error == "fail_fast" {
+                let mut unordered: FuturesUnordered<_> = pending.into_iter().collect();
+                let mut fail_fast_error = None;
+
+                while let Some(result) = unordered.next().await {
+                    if let Err(e) = result {
+                        fail_fast_error = Some(e);
+                        break;
+                    }
+                }
+
+                return match fail_fast_error.or(first_error) {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                };
+            }
 
             let results = futures::future::join_all(pending).await;
 
-            Python::attach(|py| {
-                for result in results {
-                    if let Err(e) = result {
-                        e.print(py);
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+            for result in results {
+                if let Err(e) = result {
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
                 }
-            });
+            }
 
             match first_error {
                 Some(e) => Err(e),
@@ -147,6 +186,29 @@ impl Signal {
             }
         })
     }
+}
+
+fn take_emit_snapshot(
+    listeners: &RwLock<SlotMap<DefaultKey, ListenerEntry>>,
+    py: Python<'_>,
+) -> Vec<Py<PyAny>> {
+    let mut listeners = listeners.write().unwrap();
+    let once_keys: Vec<DefaultKey> = listeners
+        .iter()
+        .filter(|(_, entry)| entry.once)
+        .map(|(key, _)| key)
+        .collect();
+
+    let snapshot: Vec<Py<PyAny>> = listeners
+        .values()
+        .map(|entry| entry.callback.clone_ref(py))
+        .collect();
+
+    for key in once_keys {
+        listeners.remove(key);
+    }
+
+    snapshot
 }
 
 fn key_to_u64(key: DefaultKey) -> u64 {
@@ -157,6 +219,16 @@ fn key_to_u64(key: DefaultKey) -> u64 {
 fn u64_to_key(value: u64) -> DefaultKey {
     use slotmap::KeyData;
     KeyData::from_ffi(value).into()
+}
+
+fn validate_on_error(on_error: &str) -> PyResult<()> {
+    match on_error {
+        "collect" | "fail_fast" => Ok(()),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "on_error must be 'collect' or 'fail_fast', got: {:?}",
+            other
+        ))),
+    }
 }
 
 #[pymodule]
