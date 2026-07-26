@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyTuple};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 use slotmap::{SlotMap, DefaultKey};
 use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -14,6 +14,14 @@ struct Signal {
     listeners: RwLock<SlotMap<DefaultKey, ListenerEntry>>,
 }
 
+impl Signal {
+    fn insert_listener(&self, callback: Py<PyAny>, once: bool) -> u64 {
+        let entry = ListenerEntry { callback, once };
+        let key = self.listeners.write().insert(entry);
+        key_to_u64(key)
+    }
+}
+
 #[pymethods]
 impl Signal {
     #[new]
@@ -24,20 +32,16 @@ impl Signal {
     }
 
     fn connect(&self, callback: Py<PyAny>) -> u64 {
-        let entry = ListenerEntry { callback, once: false };
-        let key = self.listeners.write().unwrap().insert(entry);
-        key_to_u64(key)
+        self.insert_listener(callback, false)
     }
 
     fn once(&self, callback: Py<PyAny>) -> u64 {
-        let entry = ListenerEntry { callback, once: true };
-        let key = self.listeners.write().unwrap().insert(entry);
-        key_to_u64(key)
+        self.insert_listener(callback, true)
     }
 
     fn disconnect(&self, handle: u64) {
         let key = u64_to_key(handle);
-        self.listeners.write().unwrap().remove(key);
+        self.listeners.write().remove(key);
     }
 
     #[pyo3(signature = (*args, on_error="collect"))]
@@ -192,20 +196,27 @@ fn take_emit_snapshot(
     listeners: &RwLock<SlotMap<DefaultKey, ListenerEntry>>,
     py: Python<'_>,
 ) -> Vec<Py<PyAny>> {
-    let mut listeners = listeners.write().unwrap();
-    let once_keys: Vec<DefaultKey> = listeners
+    {
+        let guard = listeners.read();
+        if !guard.values().any(|entry| entry.once) {
+            return guard.values().map(|entry| entry.callback.clone_ref(py)).collect();
+        }
+    }
+
+    let mut guard = listeners.write();
+    let once_keys: Vec<DefaultKey> = guard
         .iter()
         .filter(|(_, entry)| entry.once)
         .map(|(key, _)| key)
         .collect();
 
-    let snapshot: Vec<Py<PyAny>> = listeners
+    let snapshot: Vec<Py<PyAny>> = guard
         .values()
         .map(|entry| entry.callback.clone_ref(py))
         .collect();
 
     for key in once_keys {
-        listeners.remove(key);
+        guard.remove(key);
     }
 
     snapshot
