@@ -1,114 +1,170 @@
-# dust-riven
+# Dust Riven
 
-A fast, thread-safe Signal (observer/pub-sub) primitive for Python, implemented in Rust with PyO3 (https://pyo3.rs/).
+![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)
+![PyO3](https://img.shields.io/badge/PyO3-extension-blue)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue?logo=python)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-Inspired by blinker (https://github.com/pallets-eco/blinker), dust-riven aims to be a drop-in-style, lightweight alternative with significantly faster connect/emit performance.
+Dust Riven is a small Rust extension for Python, built with [PyO3](https://pyo3.rs/). It provides a `Signal` class, a simple event system similar to observer/pub-sub patterns. You create a `Signal`, connect callbacks to it, and `emit` it with arguments to call all connected callbacks.
 
-## Install
+## What it does
 
-```bash
-pip install dust-riven
-```
+`Signal` is a thread-safe event emitter. It lets you register functions that run when the signal is emitted, and it supports:
 
-## Usage
+- normal connections
+- one-time connections
+- connections that expire after a fixed number of calls
+- weak references, so a callback can be garbage collected without needing to manually disconnect it
 
-```python
-from dust_riven import Signal
-
-signal = Signal()
-
-def on_event(*args):
-    print("received:", args)
-
-handle = signal.connect(on_event)
-signal.emit(1, 2, 3)
-# prints: received: (1, 2, 3)
-
-signal.disconnect(handle)
-```
-
-### One-time listeners
-
-Use once() to register a listener that automatically disconnects itself after it runs a single time.
+## Basic usage
 
 ```python
-signal = Signal()
-signal.once(lambda: print("only runs once"))
+import dust_riven
 
-signal.emit()
-signal.emit()
-# prints "only runs once" a single time
+signal = dust_riven.Signal("on_update")
 ```
 
-### Async listeners
+- `connect(callback, weak=False)` - registers a callback, returns an id used to disconnect it later
+- `connect_once(callback, weak=False)` - callback runs on the first emit only
+- `connect_finite(callback, times, weak=False)` - callback runs for a fixed number of emits, then is removed
+- `disconnect(id)` - removes a specific callback
+- `emit(*args, **kwargs)` - calls all connected callbacks with the given arguments
+- `len(signal)` - number of callbacks currently connected
 
-Sync listeners are called with emit(). Async listeners must be called with emit_async(), which awaits all coroutine listeners concurrently.
+Pass `weak=True` on any connect method to hold a weak reference instead of a strong one, so the callback can be garbage collected normally if nothing else references it.
+
+## Examples
+
+### Connect and emit
 
 ```python
-import asyncio
-from dust_riven import Signal
+import dust_riven
 
-signal = Signal()
+signal = dust_riven.Signal("on_update")
 
-async def on_event(x):
-    await asyncio.sleep(0.1)
-    print("handled:", x)
+def handler(message):
+    print("got:", message)
 
-signal.connect(on_event)
-
-async def main():
-    await signal.emit_async(42)
-
-asyncio.run(main())
+signal.connect(handler)
+signal.emit("hello world")
 ```
 
-Calling emit() with an async listener registered raises a TypeError explaining that emit_async() should be used instead.
-
-### Error handling strategy
-
-Both emit() and emit_async() accept an on_error keyword argument:
-
-- on_error="collect" (default): every listener runs, then the first error encountered is raised.
-- on_error="fail_fast": stops immediately at the first error, remaining listeners are not called.
+### Connect once
 
 ```python
-signal.emit(1, 2, on_error="fail_fast")
-await signal.emit_async(1, 2, on_error="collect")
+def setup_handler():
+    print("setup ran")
+
+signal.connect_once(setup_handler)
+signal.emit()  # prints "setup ran"
+signal.emit()  # does nothing, handler already removed
 ```
 
-## API
+### Connect finite
 
-- Signal() - create a new signal.
-- signal.connect(callback) -> int - register a callback, returns a handle.
-- signal.once(callback) -> int - register a callback that auto-disconnects after it runs once, returns a handle.
-- signal.disconnect(handle) - remove a previously connected callback.
-- signal.emit(*args, on_error="collect") - call all connected sync listeners with *args.
-- signal.emit_async(*args, on_error="collect") - await all connected listeners (sync and async) with *args, running coroutines concurrently.
+```python
+def limited_handler():
+    print("called")
 
-## Benchmark
+signal.connect_finite(limited_handler, 3)
+signal.emit()  # called
+signal.emit()  # called
+signal.emit()  # called
+signal.emit()  # nothing happens, removed after 3 calls
+```
 
-A comparison script against blinker is available in bench/benchmark.py:
+### Weak connection
+
+```python
+class Listener:
+    def handle(self, value):
+        print("received", value)
+
+listener = Listener()
+signal.connect(listener.handle, weak=True)
+
+del listener
+signal.emit(42)  # dead reference is dropped silently, no crash
+```
+
+### Disconnect
+
+```python
+cb_id = signal.connect(handler)
+signal.disconnect(cb_id)
+```
+
+### Listener count
+
+```python
+print(len(signal))
+```
+
+## Behavior notes
+
+- Callbacks are collected into a snapshot before being called, so connecting or disconnecting callbacks from inside another callback during `emit` is safe.
+- If a weakly referenced callback has already been garbage collected, it is silently removed the next time `emit` runs.
+- Callbacks connected with `connect_once` or `connect_finite` are automatically removed once they've been called the requested number of times.
+
+## Building
+
+This project uses PyO3 and is built as a native Python extension, typically with [maturin](https://www.maturin.rs/). Once built, it exposes a Python module named `dust_riven` containing the `Signal` class.
+
+### Requirements
+
+- Rust toolchain
+- Python with a PyO3-compatible version
+- `parking_lot`, `once_cell`, and `smallvec` crates
+
+## Running the benchmark against blinker
+
+The repository includes `bench.py`, a script that compares `dust_riven` against the [blinker](https://pypi.org/project/blinker/) library for `connect` and `emit` performance, across different listener counts, emit counts, and strong vs weak callback variants.
+
+**1. Create and activate a virtual environment**
 
 ```bash
-pip install blinker
-python bench/benchmark.py
+python -m venv .venv
+source .venv/bin/activate
 ```
 
-## Development
+On Windows, activate with `.venv\Scripts\activate` instead.
 
-Built with maturin (https://www.maturin.rs/):
+**2. Install the needed Python packages**
 
 ```bash
-maturin develop
+pip install blinker tqdm maturin
 ```
 
-Run tests:
+**3. Build and install dust_riven into the same venv**
 
 ```bash
-pip install -e ".[dev]"
-pytest
+maturin develop --release
 ```
+
+Run this from the project root (the folder containing `Cargo.toml` and `pyproject.toml`). It compiles the Rust code and installs the `dust_riven` module directly into the active venv.
+
+**4. Run the benchmark**
+
+```bash
+python bench.py
+```
+
+This runs the full matrix of listener counts and emit counts for both strong and weak variants, and prints comparison tables with minimum/median timings plus a speedup ratio.
+
+For a fast smoke test instead of the full matrix:
+
+```bash
+python bench.py --quick
+```
+
+You can also narrow the run with options, for example:
+
+```bash
+python bench.py --listeners 1,100,1000 --emits 100,1000 --repeats 5 --variants strong --measure emit
+```
+
+Available options: `--listeners`, `--emits`, `--repeats`, `--variants`, `--libraries`, `--measure`. Run `python bench.py --help` for the full list with descriptions.
 
 ## License
 
-MIT
+MIT - see [LICENSE](LICENSE) for details.

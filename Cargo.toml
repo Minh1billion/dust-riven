@@ -9,9 +9,8 @@ name = "dust_riven"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.28.2", features = ["extension-module"] }
-pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
-futures = "0.3"
-slotmap = "1.1.1"
-parking_lot = "0.12"
+once_cell = "1.21.4"
+parking_lot = "0.12.5"
+pyo3 = "0.28.2"
+smallvec = "1.15.2"
+uuid = { version = "1", features = ["v4"] }
