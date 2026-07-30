@@ -9,7 +9,7 @@ description = "A fast, thread-safe Signal (pub-sub) primitive for Python, writte
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
-    { name = "Minh1billion", email = "[email protected]" },
+    { name = "Minh1billion", email = "minh01212929979@gmail.com" },
 ]
 keywords = ["signal", "pubsub", "rust", "pyo3"]
 classifiers = [
