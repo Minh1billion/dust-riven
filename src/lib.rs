@@ -27,6 +27,7 @@ struct Signal {
     next_id: AtomicU64,
     callbacks: RwLock<SmallVec<[CallbackEntry; 4]>>,
     weakref_mod: OnceCell<Py<PyModule>>,
+    asyncio_mod: OnceCell<Py<PyModule>>,
 }
 
 #[pymethods]
@@ -38,6 +39,7 @@ impl Signal {
             next_id: AtomicU64::new(0),
             callbacks: RwLock::new(SmallVec::new()),
             weakref_mod: OnceCell::new(),
+            asyncio_mod: OnceCell::new(),
         }
     }
 
@@ -153,6 +155,64 @@ impl Signal {
             callback.call(py, args, kwargs)?;
         }
         Ok(())
+    }
+
+    #[pyo3(signature = (*args, **kwargs))]
+    fn emit_async(
+        &self,
+        py: Python<'_>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        let guard = self.callbacks.read();
+        let mut dead_ids = HashSet::new();
+        let mut snapshot = Vec::with_capacity(guard.len());
+        for entry in guard.iter() {
+            if let Some(remaining) = &entry.remaining {
+                let prev = remaining.fetch_sub(1, Ordering::Relaxed);
+                if prev == 0 {
+                    dead_ids.insert(entry.id);
+                    continue;
+                }
+                if prev == 1 {
+                    dead_ids.insert(entry.id);
+                }
+            }
+            match &entry.callback {
+                Callback::Strong(callback) => snapshot.push(callback.clone_ref(py)),
+                Callback::Weak(weakref_obj) => {
+                    let referent = weakref_obj.call0(py)?;
+                    if referent.is_none(py) {
+                        dead_ids.insert(entry.id);
+                    } else {
+                        snapshot.push(referent);
+                    }
+                }
+            }
+        }
+        drop(guard);
+
+        if !dead_ids.is_empty() {
+            self.callbacks
+                .write()
+                .retain(|entry| !dead_ids.contains(&entry.id));
+        }
+
+        let asyncio = self
+            .asyncio_mod
+            .get_or_try_init(|| py.import("asyncio").map(|m| m.unbind()))?
+            .bind(py);
+
+        let mut awaitables: Vec<Py<PyAny>> = Vec::with_capacity(snapshot.len());
+        for callback in snapshot {
+            let result = callback.call(py, args, kwargs)?;
+            if result.bind(py).hasattr("__await__")? {
+                awaitables.push(result);
+            }
+        }
+
+        let gathered = asyncio.call_method1("gather", PyTuple::new(py, awaitables)?)?;
+        Ok(gathered.unbind())
     }
 
     fn __len__(&self) -> usize {
