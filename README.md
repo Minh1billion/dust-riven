@@ -153,8 +153,10 @@ print(len(signal))
 - Callbacks connected with `connect_once` or `connect_finite` are automatically removed once they've been called the requested number of times.
 - By default, `emit` uses `on_error="fast_fail"`: the first exception raised by a callback propagates immediately and any callbacks after it are skipped. With `on_error="collect"`, all callbacks run no matter what, and exceptions are returned in the result list rather than raised.
 - `emit_async` calls every callback the same way `emit` does; any callback that returns an awaitable (e.g. an `async def`) has that awaitable scheduled via `asyncio.gather` and run concurrently once you `await` the result. Purely synchronous callbacks run immediately, before the returned value is awaited.
+- `emit_async` must be called from a thread with an already-running `asyncio` event loop (i.e. `await signal.emit_async()` from inside a coroutine) - this applies even if every connected callback is synchronous. Calling it with no loop running (e.g. `asyncio.run(signal.emit_async())`, where the call happens before `run` starts its loop) raises `RuntimeError`.
 - With `emit_async`, an exception from a synchronous callback is raised as soon as it's called (before you even reach the `await`), while an exception from an async callback surfaces when the gathered result is awaited.
 - If a callback raises during `emit_async`, remaining callbacks are not called, and any async callback's coroutine already created before the error is closed rather than left dangling.
+- `Signal` participates in Python's cyclic garbage collector, so a callback that holds a reference back to its own `Signal` (e.g. a closure or bound method capturing the signal it's connected to) doesn't leak - `gc.collect()` can still find and break that cycle even though nothing was ever explicitly disconnected.
 
 ## Building
 

@@ -27,6 +27,8 @@ struct Signal {
     next_id: AtomicU64,
     callbacks: RwLock<SmallVec<[CallbackEntry; 4]>>,
     weakref_mod: OnceCell<Py<PyModule>>,
+    asyncio_mod: OnceCell<Py<PyModule>>,
+    immediate_fn: OnceCell<Py<PyAny>>,
 }
 
 fn saturating_dec(remaining: &AtomicU64) -> Option<bool> {
@@ -43,6 +45,29 @@ fn saturating_dec(remaining: &AtomicU64) -> Option<bool> {
     }
 }
 
+impl Signal {
+    fn get_immediate_fn(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let f = self.immediate_fn.get_or_try_init(|| -> PyResult<Py<PyAny>> {
+            let module = PyModule::from_code(
+                py,
+                c"async def _dust_riven_immediate(value):\n    return value\n",
+                c"dust_riven_internal.py",
+                c"dust_riven_internal",
+            )?;
+            let func = module.getattr("_dust_riven_immediate")?;
+            Ok(func.unbind())
+        })?;
+        Ok(f.clone_ref(py))
+    }
+
+    fn get_asyncio(&self, py: Python<'_>) -> PyResult<Py<PyModule>> {
+        let m = self
+            .asyncio_mod
+            .get_or_try_init(|| py.import("asyncio").map(|m| m.unbind()))?;
+        Ok(m.clone_ref(py))
+    }
+}
+
 #[pymethods]
 impl Signal {
     #[new]
@@ -53,6 +78,8 @@ impl Signal {
             next_id: AtomicU64::new(0),
             callbacks: RwLock::new(SmallVec::new()),
             weakref_mod: OnceCell::new(),
+            asyncio_mod: OnceCell::new(),
+            immediate_fn: OnceCell::new(),
         }
     }
 
@@ -305,18 +332,38 @@ impl Signal {
             }
         }
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let futures: Vec<_> = Python::attach(|py| -> PyResult<Vec<_>> {
-                awaitables
-                    .into_iter()
-                    .map(|obj| pyo3_async_runtimes::tokio::into_future(obj.into_bound(py)))
-                    .collect()
-            })?;
+        let asyncio = self.get_asyncio(py)?;
+        asyncio.bind(py).call_method0("get_running_loop")?;
 
-            let results: Vec<Py<PyAny>> = futures::future::try_join_all(futures).await?;
-            Ok(results)
-        })
-        .map(|bound| bound.unbind())
+        if awaitables.is_empty() {
+            let immediate = self.get_immediate_fn(py)?;
+            let empty_list = pyo3::types::PyList::empty(py);
+            let coro = immediate.bind(py).call1((empty_list,))?;
+            return Ok(coro.unbind());
+        }
+
+        let awaitables_tuple = pyo3::types::PyTuple::new(py, awaitables)?;
+        let gathered = asyncio.bind(py).call_method1("gather", awaitables_tuple)?;
+        Ok(gathered.unbind())
+    }
+
+    fn __traverse__(&self, visit: pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
+        let guard = self.callbacks.read();
+        for entry in guard.iter() {
+            match &entry.callback {
+                Callback::Strong(cb) => visit.call(cb)?,
+                Callback::Weak(w) => visit.call(w)?,
+            }
+        }
+        drop(guard);
+        if let Some(f) = self.immediate_fn.get() {
+            visit.call(f)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        self.callbacks.write().clear();
     }
 
     fn __len__(&self) -> usize {
