@@ -14,3 +14,6 @@ parking_lot = "0.12.5"
 pyo3 = "0.28.2"
 smallvec = "1.15.2"
 uuid = { version = "1", features = ["v4"] }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+futures = "0.3"

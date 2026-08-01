@@ -134,6 +134,7 @@ print(len(signal))
 - Callbacks connected with `connect_once` or `connect_finite` are automatically removed once they've been called the requested number of times.
 - `emit_async` calls every callback the same way `emit` does; any callback that returns an awaitable (e.g. an `async def`) has that awaitable scheduled via `asyncio.gather` and run concurrently once you `await` the result. Purely synchronous callbacks run immediately, before the returned value is awaited.
 - With `emit_async`, an exception from a synchronous callback is raised as soon as it's called (before you even reach the `await`), while an exception from an async callback surfaces when the gathered result is awaited.
+- If a callback raises during `emit_async`, remaining callbacks are not called, and any async callback's coroutine already created before the error is closed rather than left dangling.
 
 ## Building
 
