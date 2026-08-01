@@ -29,6 +29,20 @@ struct Signal {
     weakref_mod: OnceCell<Py<PyModule>>,
 }
 
+fn saturating_dec(remaining: &AtomicU64) -> Option<bool> {
+    let mut current = remaining.load(Ordering::Relaxed);
+    loop {
+        if current == 0 {
+            return None;
+        }
+        let new = current - 1;
+        match remaining.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(new == 0),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[pymethods]
 impl Signal {
     #[new]
@@ -115,33 +129,39 @@ impl Signal {
         args: &Bound<'_, PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
-        let guard = self.callbacks.read();
         let mut dead_ids = HashSet::new();
-        let mut snapshot = Vec::with_capacity(guard.len());
+        let mut snapshot = Vec::new();
+        let mut weak_pending: Vec<(u64, Py<PyAny>)> = Vec::new();
+
+        let guard = self.callbacks.read();
         for entry in guard.iter() {
             if let Some(remaining) = &entry.remaining {
-                let prev = remaining.fetch_sub(1, Ordering::Relaxed);
-                if prev == 0 {
-                    dead_ids.insert(entry.id);
-                    continue;
-                }
-                if prev == 1 {
-                    dead_ids.insert(entry.id);
+                match saturating_dec(remaining) {
+                    None => {
+                        dead_ids.insert(entry.id);
+                        continue;
+                    }
+                    Some(true) => {
+                        dead_ids.insert(entry.id);
+                    }
+                    Some(false) => {}
                 }
             }
             match &entry.callback {
                 Callback::Strong(callback) => snapshot.push(callback.clone_ref(py)),
-                Callback::Weak(weakref_obj) => {
-                    let referent = weakref_obj.call0(py)?;
-                    if referent.is_none(py) {
-                        dead_ids.insert(entry.id);
-                    } else {
-                        snapshot.push(referent);
-                    }
-                }
+                Callback::Weak(weakref_obj) => weak_pending.push((entry.id, weakref_obj.clone_ref(py))),
             }
         }
         drop(guard);
+
+        for (id, weakref_obj) in weak_pending {
+            let referent = weakref_obj.call0(py)?;
+            if referent.is_none(py) {
+                dead_ids.insert(id);
+            } else {
+                snapshot.push(referent);
+            }
+        }
 
         if !dead_ids.is_empty() {
             self.callbacks
@@ -153,6 +173,86 @@ impl Signal {
             callback.call(py, args, kwargs)?;
         }
         Ok(())
+    }
+
+    #[pyo3(signature = (*args, **kwargs))]
+    fn emit_async(
+        &self,
+        py: Python<'_>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        let mut dead_ids = HashSet::new();
+        let mut snapshot = Vec::new();
+        let mut weak_pending: Vec<(u64, Py<PyAny>)> = Vec::new();
+
+        let guard = self.callbacks.read();
+        for entry in guard.iter() {
+            if let Some(remaining) = &entry.remaining {
+                match saturating_dec(remaining) {
+                    None => {
+                        dead_ids.insert(entry.id);
+                        continue;
+                    }
+                    Some(true) => {
+                        dead_ids.insert(entry.id);
+                    }
+                    Some(false) => {}
+                }
+            }
+            match &entry.callback {
+                Callback::Strong(callback) => snapshot.push(callback.clone_ref(py)),
+                Callback::Weak(weakref_obj) => weak_pending.push((entry.id, weakref_obj.clone_ref(py))),
+            }
+        }
+        drop(guard);
+
+        for (id, weakref_obj) in weak_pending {
+            let referent = weakref_obj.call0(py)?;
+            if referent.is_none(py) {
+                dead_ids.insert(id);
+            } else {
+                snapshot.push(referent);
+            }
+        }
+
+        if !dead_ids.is_empty() {
+            self.callbacks
+                .write()
+                .retain(|entry| !dead_ids.contains(&entry.id));
+        }
+
+        let mut awaitables: Vec<Py<PyAny>> = Vec::with_capacity(snapshot.len());
+        for callback in snapshot {
+            let result = match callback.call(py, args, kwargs) {
+                Ok(result) => result,
+                Err(e) => {
+                    for obj in awaitables {
+                        let bound = obj.bind(py);
+                        if bound.hasattr("close")? {
+                            let _ = bound.call_method0("close");
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+            if result.bind(py).hasattr("__await__")? {
+                awaitables.push(result);
+            }
+        }
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let futures: Vec<_> = Python::attach(|py| -> PyResult<Vec<_>> {
+                awaitables
+                    .into_iter()
+                    .map(|obj| pyo3_async_runtimes::tokio::into_future(obj.into_bound(py)))
+                    .collect()
+            })?;
+
+            let results: Vec<Py<PyAny>> = futures::future::try_join_all(futures).await?;
+            Ok(results)
+        })
+        .map(|bound| bound.unbind())
     }
 
     fn __len__(&self) -> usize {

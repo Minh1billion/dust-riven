@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import itertools
 import statistics
@@ -18,16 +19,43 @@ def make_unique_callback():
     return cb
 
 
+def make_unique_async_callback():
+    async def cb(*args, **kwargs):
+        pass
+    return cb
+
+
+async def _blinker_emit_async(sig):
+    results = sig.send()
+    awaitables = [r for _, r in results if hasattr(r, "__await__")]
+    if awaitables:
+        await asyncio.gather(*awaitables)
+
+
+async def _dust_riven_emit_async(sig):
+    await sig.emit_async()
+
+
+def _wrap_for_blinker_async(cb):
+    def wrapper(*args, **kwargs):
+        return cb(*args, **kwargs)
+    return wrapper
+
+
 LIBRARIES = {
     "blinker": {
         "new_signal": lambda: blinker.Signal(),
         "connect": lambda sig, cb, weak: sig.connect(cb, weak=weak),
         "emit": lambda sig: sig.send(),
+        "emit_async": lambda sig: _blinker_emit_async(sig),
+        "prepare_async_callback": lambda cb: _wrap_for_blinker_async(cb),
     },
     "dust_riven": {
         "new_signal": lambda: dust_riven.Signal("bench"),
         "connect": lambda sig, cb, weak: sig.connect(cb, weak=weak),
         "emit": lambda sig: sig.emit(),
+        "emit_async": lambda sig: _dust_riven_emit_async(sig),
+        "prepare_async_callback": lambda cb: cb,
     },
 }
 
@@ -55,11 +83,15 @@ class CaseResult:
     t_med: float
 
 
-def _build_signal(lib_name, n_listeners, weak):
+def _build_signal(lib_name, n_listeners, weak, async_cb=False):
     new_signal = LIBRARIES[lib_name]["new_signal"]
     connect = LIBRARIES[lib_name]["connect"]
     sig = new_signal()
-    callbacks = [make_unique_callback() for _ in range(n_listeners)]
+    if async_cb:
+        prepare = LIBRARIES[lib_name].get("prepare_async_callback", lambda cb: cb)
+        callbacks = [prepare(make_unique_async_callback()) for _ in range(n_listeners)]
+    else:
+        callbacks = [make_unique_callback() for _ in range(n_listeners)]
     for cb in callbacks:
         connect(sig, cb, weak)
     return sig, callbacks
@@ -105,6 +137,33 @@ def time_emit(lib_name, weak, n_listeners, n_emits, repeats, progress=None):
     return samples
 
 
+async def _run_emits_async(emit_async, sig, n_emits):
+    for _ in range(n_emits):
+        await emit_async(sig)
+
+
+def time_emit_async(lib_name, weak, n_listeners, n_emits, repeats, progress=None):
+    emit_async = LIBRARIES[lib_name]["emit_async"]
+    samples = []
+    loop = asyncio.new_event_loop()
+    try:
+        for i in range(repeats + 1):
+            sig, callbacks = _build_signal(lib_name, n_listeners, weak, async_cb=True)
+            gc.collect()
+            gc.disable()
+            start = time.perf_counter()
+            loop.run_until_complete(_run_emits_async(emit_async, sig, n_emits))
+            end = time.perf_counter()
+            gc.enable()
+            if i > 0:
+                samples.append(end - start)
+            if progress is not None:
+                progress.update(1)
+    finally:
+        loop.close()
+    return samples
+
+
 def build_cases(cfg: BenchConfig):
     cases = []
     if "connect" in cfg.measure:
@@ -113,6 +172,9 @@ def build_cases(cfg: BenchConfig):
     if "emit" in cfg.measure:
         for variant, lib, n_listeners, n_emits in itertools.product(cfg.variants, cfg.libraries, cfg.listeners, cfg.emits):
             cases.append(("emit", lib, variant, n_listeners, n_emits))
+    if "emit_async" in cfg.measure:
+        for variant, lib, n_listeners, n_emits in itertools.product(cfg.variants, cfg.libraries, cfg.listeners, cfg.emits):
+            cases.append(("emit_async", lib, variant, n_listeners, n_emits))
     return cases
 
 
@@ -128,6 +190,8 @@ def run_cases(cfg: BenchConfig) -> list:
         try:
             if kind == "connect":
                 samples = time_connect(lib, weak, n_listeners, cfg.repeats, progress=inner)
+            elif kind == "emit_async":
+                samples = time_emit_async(lib, weak, n_listeners, n_emits, cfg.repeats, progress=inner)
             else:
                 samples = time_emit(lib, weak, n_listeners, n_emits, cfg.repeats, progress=inner)
         finally:
@@ -157,8 +221,12 @@ def print_table(results, kind, variant, libraries):
     keys = sorted({tuple(getattr(r, f) for f in key_fields) for r in rows})
     by_key_lib = {(tuple(getattr(r, f) for f in key_fields), r.library): r for r in rows}
 
-    title = "connect() cost, N listeners" if kind == "connect" else "emit() cost, listeners x emits"
-    print(f"\n=== {title} [{variant}] ===")
+    titles = {
+        "connect": "connect() cost, N listeners",
+        "emit": "emit() cost, listeners x emits",
+        "emit_async": "emit_async() cost, listeners x emits (async listeners)",
+    }
+    print(f"\n=== {titles[kind]} [{variant}] ===")
 
     key_header = "listeners" if kind == "connect" else "listeners     emits"
     col_header = " | ".join(f"{lib+' min':>14} {lib+' med':>14}" for lib in libraries)
@@ -201,8 +269,8 @@ def parse_config() -> BenchConfig:
                          help="Comma-separated subset of: strong,weak")
     parser.add_argument("--libraries", type=lambda s: s.split(","), default=["blinker", "dust_riven"],
                          help="Comma-separated subset of: blinker,dust_riven")
-    parser.add_argument("--measure", type=lambda s: s.split(","), default=["connect", "emit"],
-                         help="Comma-separated subset of: connect,emit")
+    parser.add_argument("--measure", type=lambda s: s.split(","), default=["connect", "emit", "emit_async"],
+                         help="Comma-separated subset of: connect,emit,emit_async")
     parser.add_argument("--quick", action="store_true",
                          help="Shortcut for a small smoke-test matrix (overrides listeners/emits/repeats)")
     args = parser.parse_args()
@@ -214,8 +282,8 @@ def parse_config() -> BenchConfig:
         if lib not in LIBRARIES:
             parser.error(f"unknown library '{lib}', choose from {list(LIBRARIES)}")
     for m in args.measure:
-        if m not in ("connect", "emit"):
-            parser.error(f"unknown measure '{m}', choose from connect,emit")
+        if m not in ("connect", "emit", "emit_async"):
+            parser.error(f"unknown measure '{m}', choose from connect,emit,emit_async")
 
     if args.quick:
         return BenchConfig(

@@ -29,6 +29,7 @@ signal = dust_riven.Signal("on_update")
 - `connect_finite(callback, times, weak=False)` - callback runs for a fixed number of emits, then is removed
 - `disconnect(id)` - removes a specific callback
 - `emit(*args, **kwargs)` - calls all connected callbacks with the given arguments
+- `emit_async(*args, **kwargs)` - like `emit`, but if a callback returns an awaitable (e.g. it's an `async def`), those are collected and run concurrently with `asyncio.gather`; must be awaited
 - `len(signal)` - number of callbacks currently connected
 
 Pass `weak=True` on any connect method to hold a weak reference instead of a strong one, so the callback can be garbage collected normally if nothing else references it.
@@ -73,6 +74,32 @@ signal.emit()  # called
 signal.emit()  # nothing happens, removed after 3 calls
 ```
 
+### Async emit
+
+```python
+import asyncio
+import dust_riven
+
+signal = dust_riven.Signal("on_update")
+
+def sync_handler(value):
+    print("sync:", value)
+
+async def async_handler(value):
+    await asyncio.sleep(0.1)
+    print("async:", value)
+
+signal.connect(sync_handler)
+signal.connect(async_handler)
+
+async def main():
+    # sync_handler runs immediately; async_handler is awaited
+    # concurrently alongside any other async listeners
+    await signal.emit_async(42)
+
+asyncio.run(main())
+```
+
 ### Weak connection
 
 ```python
@@ -105,6 +132,9 @@ print(len(signal))
 - Callbacks are collected into a snapshot before being called, so connecting or disconnecting callbacks from inside another callback during `emit` is safe.
 - If a weakly referenced callback has already been garbage collected, it is silently removed the next time `emit` runs.
 - Callbacks connected with `connect_once` or `connect_finite` are automatically removed once they've been called the requested number of times.
+- `emit_async` calls every callback the same way `emit` does; any callback that returns an awaitable (e.g. an `async def`) has that awaitable scheduled via `asyncio.gather` and run concurrently once you `await` the result. Purely synchronous callbacks run immediately, before the returned value is awaited.
+- With `emit_async`, an exception from a synchronous callback is raised as soon as it's called (before you even reach the `await`), while an exception from an async callback surfaces when the gathered result is awaited.
+- If a callback raises during `emit_async`, remaining callbacks are not called, and any async callback's coroutine already created before the error is closed rather than left dangling.
 
 ## Building
 
