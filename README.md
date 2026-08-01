@@ -28,11 +28,11 @@ signal = dust_riven.Signal("on_update")
 - `connect_once(callback, weak=False)` - callback runs on the first emit only
 - `connect_finite(callback, times, weak=False)` - callback runs for a fixed number of emits, then is removed
 - `disconnect(id)` - removes a specific callback
-- `emit(*args, **kwargs)` - calls all connected callbacks with the given arguments
+- `emit(*args, on_error="fast_fail", **kwargs)` - calls all connected callbacks with the given arguments. With `on_error="fast_fail"` (default), the first exception raised stops execution and propagates immediately, and remaining callbacks are not called. With `on_error="collect"`, every callback runs regardless of exceptions; the returned list contains each callback's return value, or the exception instance itself in place of a return value for any callback that raised.
 - `emit_async(*args, **kwargs)` - like `emit`, but if a callback returns an awaitable (e.g. it's an `async def`), those are collected and run concurrently with `asyncio.gather`; must be awaited
 - `len(signal)` - number of callbacks currently connected
 
-Pass `weak=True` on any connect method to hold a weak reference instead of a strong one, so the callback can be garbage collected normally if nothing else references it.
+Pass `weak=True` on any connect method to hold a weak reference instead of a strong one, so the callback can be garbage collected normally if nothing else references it. If the callback has no other strong reference at the time you connect it (so it would be garbage collected immediately), the connect call raises `TypeError` instead of silently connecting a listener that can never fire.
 
 ## Examples
 
@@ -72,6 +72,22 @@ signal.emit()  # called
 signal.emit()  # called
 signal.emit()  # called
 signal.emit()  # nothing happens, removed after 3 calls
+```
+
+### Collecting errors instead of failing fast
+
+```python
+def ok():
+    return "fine"
+
+def boom():
+    raise ValueError("bad listener")
+
+signal.connect(ok)
+signal.connect(boom)
+
+results = signal.emit(on_error="collect")
+# results == ["fine", ValueError("bad listener")]
 ```
 
 ### Async emit
@@ -132,6 +148,7 @@ print(len(signal))
 - Callbacks are collected into a snapshot before being called, so connecting or disconnecting callbacks from inside another callback during `emit` is safe.
 - If a weakly referenced callback has already been garbage collected, it is silently removed the next time `emit` runs.
 - Callbacks connected with `connect_once` or `connect_finite` are automatically removed once they've been called the requested number of times.
+- By default, `emit` uses `on_error="fast_fail"`: the first exception raised by a callback propagates immediately and any callbacks after it are skipped. With `on_error="collect"`, all callbacks run no matter what, and exceptions are returned in the result list rather than raised.
 - `emit_async` calls every callback the same way `emit` does; any callback that returns an awaitable (e.g. an `async def`) has that awaitable scheduled via `asyncio.gather` and run concurrently once you `await` the result. Purely synchronous callbacks run immediately, before the returned value is awaited.
 - With `emit_async`, an exception from a synchronous callback is raised as soon as it's called (before you even reach the `await`), while an exception from an async callback surfaces when the gathered result is awaited.
 - If a callback raises during `emit_async`, remaining callbacks are not called, and any async callback's coroutine already created before the error is closed rather than left dangling.

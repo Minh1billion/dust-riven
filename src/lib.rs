@@ -61,10 +61,26 @@ impl Signal {
             return Err(PyTypeError::new_err("Callback must be a function."));
         }
         let callback = if weak {
+            let bound_cb = callback.bind(py);
+            let is_bound_method = bound_cb.hasattr("__self__")?;
+            let (refcount, refcount_threshold): (usize, usize) = if is_bound_method {
+                let slf = bound_cb.getattr("__self__")?;
+                let rc = py.import("sys")?.call_method1("getrefcount", (slf,))?.extract()?;
+                (rc, 2)
+            } else {
+                let rc = py.import("sys")?.call_method1("getrefcount", (bound_cb,))?.extract()?;
+                (rc, 3)
+            };
+            if refcount <= refcount_threshold {
+                return Err(PyTypeError::new_err(
+                    "Callback passed with weak=True has no other strong reference and would be garbage collected immediately.",
+                ));
+            }
             let weakref_mod = self
                 .weakref_mod
                 .get_or_try_init(|| py.import("weakref").map(|m| m.unbind()))?;
-            let weakref_obj = weakref_mod.bind(py).call_method1("ref", (callback,))?;
+            let ctor = if is_bound_method { "WeakMethod" } else { "ref" };
+            let weakref_obj = weakref_mod.bind(py).call_method1(ctor, (callback,))?;
             Callback::Weak(weakref_obj.unbind())
         } else {
             Callback::Strong(callback)
@@ -80,10 +96,26 @@ impl Signal {
             return Err(PyTypeError::new_err("Callback must be a function."));
         }
         let callback = if weak {
+            let bound_cb = callback.bind(py);
+            let is_bound_method = bound_cb.hasattr("__self__")?;
+            let (refcount, refcount_threshold): (usize, usize) = if is_bound_method {
+                let slf = bound_cb.getattr("__self__")?;
+                let rc = py.import("sys")?.call_method1("getrefcount", (slf,))?.extract()?;
+                (rc, 2)
+            } else {
+                let rc = py.import("sys")?.call_method1("getrefcount", (bound_cb,))?.extract()?;
+                (rc, 3)
+            };
+            if refcount <= refcount_threshold {
+                return Err(PyTypeError::new_err(
+                    "Callback passed with weak=True has no other strong reference and would be garbage collected immediately.",
+                ));
+            }
             let weakref_mod = self
                 .weakref_mod
                 .get_or_try_init(|| py.import("weakref").map(|m| m.unbind()))?;
-            let weakref_obj = weakref_mod.bind(py).call_method1("ref", (callback,))?;
+            let ctor = if is_bound_method { "WeakMethod" } else { "ref" };
+            let weakref_obj = weakref_mod.bind(py).call_method1(ctor, (callback,))?;
             Callback::Weak(weakref_obj.unbind())
         } else {
             Callback::Strong(callback)
@@ -102,10 +134,26 @@ impl Signal {
             return Err(PyTypeError::new_err("times must be greater than zero."));
         }
         let callback = if weak {
+            let bound_cb = callback.bind(py);
+            let is_bound_method = bound_cb.hasattr("__self__")?;
+            let (refcount, refcount_threshold): (usize, usize) = if is_bound_method {
+                let slf = bound_cb.getattr("__self__")?;
+                let rc = py.import("sys")?.call_method1("getrefcount", (slf,))?.extract()?;
+                (rc, 2)
+            } else {
+                let rc = py.import("sys")?.call_method1("getrefcount", (bound_cb,))?.extract()?;
+                (rc, 3)
+            };
+            if refcount <= refcount_threshold {
+                return Err(PyTypeError::new_err(
+                    "Callback passed with weak=True has no other strong reference and would be garbage collected immediately.",
+                ));
+            }
             let weakref_mod = self
                 .weakref_mod
                 .get_or_try_init(|| py.import("weakref").map(|m| m.unbind()))?;
-            let weakref_obj = weakref_mod.bind(py).call_method1("ref", (callback,))?;
+            let ctor = if is_bound_method { "WeakMethod" } else { "ref" };
+            let weakref_obj = weakref_mod.bind(py).call_method1(ctor, (callback,))?;
             Callback::Weak(weakref_obj.unbind())
         } else {
             Callback::Strong(callback)
@@ -122,13 +170,18 @@ impl Signal {
         Ok(guard.len() != before)
     }
 
-    #[pyo3(signature = (*args, **kwargs))]
+    #[pyo3(signature = (*args, on_error="fast_fail", **kwargs))]
     fn emit(
         &self,
         py: Python<'_>,
         args: &Bound<'_, PyTuple>,
+        on_error: &str,
         kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Py<PyAny>> {
+        if on_error != "fast_fail" && on_error != "collect" {
+            return Err(PyTypeError::new_err("on_error must be 'fast_fail' or 'collect'."));
+        }
+
         let mut dead_ids = HashSet::new();
         let mut snapshot = Vec::new();
         let mut weak_pending: Vec<(u64, Py<PyAny>)> = Vec::new();
@@ -169,10 +222,20 @@ impl Signal {
                 .retain(|entry| !dead_ids.contains(&entry.id));
         }
 
+        let mut results: Vec<Py<PyAny>> = Vec::with_capacity(snapshot.len());
         for callback in snapshot {
-            callback.call(py, args, kwargs)?;
+            match callback.call(py, args, kwargs) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    if on_error == "fast_fail" {
+                        return Err(e);
+                    }
+                    results.push(e.value(py).clone().unbind().into());
+                }
+            }
         }
-        Ok(())
+
+        Ok(pyo3::types::PyList::new(py, results)?.unbind().into())
     }
 
     #[pyo3(signature = (*args, **kwargs))]
