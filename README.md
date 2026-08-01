@@ -24,6 +24,9 @@ import dust_riven
 signal = dust_riven.Signal("on_update")
 ```
 
+`name` is optional and defaults to `None` - `dust_riven.Signal()` works just as well as `dust_riven.Signal("on_update")`. Naming a signal is mainly useful for `repr(signal)`, which is handy in logs and debuggers when a program has many signals.
+
+- `Signal(name=None)` - creates a new signal, optionally with a name
 - `connect(callback, weak=False)` - registers a callback, returns an id used to disconnect it later
 - `connect_once(callback, weak=False)` - callback runs on the first emit only
 - `connect_finite(callback, times, weak=False)` - callback runs for a fixed number of emits, then is removed

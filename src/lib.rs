@@ -23,7 +23,7 @@ struct CallbackEntry {
 
 #[pyclass(frozen)]
 struct Signal {
-    name: String,
+    name: Option<String>,
     next_id: AtomicU64,
     callbacks: RwLock<SmallVec<[CallbackEntry; 4]>>,
     weakref_mod: OnceCell<Py<PyModule>>,
@@ -46,7 +46,8 @@ fn saturating_dec(remaining: &AtomicU64) -> Option<bool> {
 #[pymethods]
 impl Signal {
     #[new]
-    fn new(name: String) -> Signal {
+    #[pyo3(signature = (name=None))]
+    fn new(name: Option<String>) -> Signal {
         Signal {
             name,
             next_id: AtomicU64::new(0),
@@ -323,7 +324,11 @@ impl Signal {
     }
 
     fn __repr__(&self) -> String {
-        format!("Signal(name={:?}, listeners={})", self.name, self.callbacks.read().len())
+        let listeners = self.callbacks.read().len();
+        match &self.name {
+            Some(name) => format!("Signal(name={:?}, listeners={})", name, listeners),
+            None => format!("Signal(name=None, listeners={})", listeners),
+        }
     }
 }
 
