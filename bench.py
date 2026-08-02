@@ -260,9 +260,9 @@ def parse_int_list(s):
 
 def parse_config() -> BenchConfig:
     parser = argparse.ArgumentParser(description="Benchmark blinker vs dust_riven Signal implementations.")
-    parser.add_argument("--listeners", type=parse_int_list, default=[1, 10, 100, 1000, 3000],
+    parser.add_argument("--listeners", type=parse_int_list, default=[1, 10, 100, 1000],
                          help="Comma-separated listener counts, e.g. 1,10,100")
-    parser.add_argument("--emits", type=parse_int_list, default=[1, 10, 100, 1000, 3000],
+    parser.add_argument("--emits", type=parse_int_list, default=[1, 10, 100, 1000],
                          help="Comma-separated emit counts, e.g. 1,10,100")
     parser.add_argument("--repeats", type=int, default=7, help="Samples per case")
     parser.add_argument("--variants", type=lambda s: s.split(","), default=["strong", "weak"],
