@@ -31,6 +31,30 @@ struct Signal {
     immediate_fn: OnceCell<Py<PyAny>>,
 }
 
+#[pyclass]
+struct SignalConnection {
+    signal: Py<Signal>,
+    id: u64,
+}
+
+#[pymethods]
+impl SignalConnection {
+    fn __enter__(&self) -> u64 {
+        self.id
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Bound<'_, PyAny>,
+        _exc_val: Bound<'_, PyAny>,
+        _exc_tb: Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.signal.borrow(py).disconnect(self.id)?;
+        Ok(false)
+    }
+}
+
 fn saturating_dec(remaining: &AtomicU64) -> Option<bool> {
     let mut current = remaining.load(Ordering::Relaxed);
     loop {
@@ -196,6 +220,12 @@ impl Signal {
         let before = guard.len();
         guard.retain(|entry| entry.id != id);
         Ok(guard.len() != before)
+    }
+
+    #[pyo3(signature = (callback, weak=false))]
+    fn connected(slf: Py<Self>, py: Python<'_>, callback: Py<PyAny>, weak: bool) -> PyResult<SignalConnection> {
+        let id = slf.borrow(py).connect(py, callback, weak)?;
+        Ok(SignalConnection { signal: slf, id })
     }
 
     #[pyo3(signature = (*args, on_error="fast_fail", **kwargs))]
@@ -382,5 +412,6 @@ impl Signal {
 #[pymodule]
 fn dust_riven(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Signal>()?;
+    m.add_class::<SignalConnection>()?;
     Ok(())
 }
