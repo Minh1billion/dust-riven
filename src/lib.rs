@@ -17,18 +17,19 @@ enum Callback {
 
 struct CallbackEntry {
     id: u64,
+    priority: i32,
     callback: Callback,
     remaining: Option<AtomicU64>,
 }
 
-#[pyclass(frozen)]
-struct Signal {
-    name: Option<String>,
-    next_id: AtomicU64,
-    callbacks: RwLock<SmallVec<[CallbackEntry; 4]>>,
-    weakref_mod: OnceCell<Py<PyModule>>,
-    asyncio_mod: OnceCell<Py<PyModule>>,
-    immediate_fn: OnceCell<Py<PyAny>>,
+fn insert_sorted(callbacks: &mut SmallVec<[CallbackEntry; 4]>, entry: CallbackEntry) {
+    let pos = callbacks.partition_point(|e| e.priority >= entry.priority);
+    callbacks.insert(pos, entry);
+}
+
+enum PendingCallback {
+    Resolved(Py<PyAny>),
+    Weak(u64, Py<PyAny>),
 }
 
 #[pyclass]
@@ -53,6 +54,16 @@ impl SignalConnection {
         self.signal.borrow(py).disconnect(self.id)?;
         Ok(false)
     }
+}
+
+#[pyclass(frozen)]
+struct Signal {
+    name: Option<String>,
+    next_id: AtomicU64,
+    callbacks: RwLock<SmallVec<[CallbackEntry; 4]>>,
+    weakref_mod: OnceCell<Py<PyModule>>,
+    asyncio_mod: OnceCell<Py<PyModule>>,
+    immediate_fn: OnceCell<Py<PyAny>>,
 }
 
 fn saturating_dec(remaining: &AtomicU64) -> Option<bool> {
@@ -107,8 +118,8 @@ impl Signal {
         }
     }
 
-    #[pyo3(signature = (callback, weak=false))]
-    fn connect(&self, py: Python<'_>, callback: Py<PyAny>, weak: bool) -> PyResult<u64> {
+    #[pyo3(signature = (callback, weak=false, priority=0))]
+    fn connect(&self, py: Python<'_>, callback: Py<PyAny>, weak: bool, priority: i32) -> PyResult<u64> {
         if !callback.bind(py).is_callable() {
             return Err(PyTypeError::new_err("Callback must be a function."));
         }
@@ -138,12 +149,12 @@ impl Signal {
             Callback::Strong(callback)
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.callbacks.write().push(CallbackEntry { id, callback, remaining: None });
+        insert_sorted(&mut self.callbacks.write(), CallbackEntry { id, priority, callback, remaining: None });
         Ok(id)
     }
 
-    #[pyo3(signature = (callback, weak=false))]
-    fn connect_once(&self, py: Python<'_>, callback: Py<PyAny>, weak: bool) -> PyResult<u64> {
+    #[pyo3(signature = (callback, weak=false, priority=0))]
+    fn connect_once(&self, py: Python<'_>, callback: Py<PyAny>, weak: bool, priority: i32) -> PyResult<u64> {
         if !callback.bind(py).is_callable() {
             return Err(PyTypeError::new_err("Callback must be a function."));
         }
@@ -173,12 +184,12 @@ impl Signal {
             Callback::Strong(callback)
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.callbacks.write().push(CallbackEntry { id, callback, remaining: Some(AtomicU64::new(1)) });
+        insert_sorted(&mut self.callbacks.write(), CallbackEntry { id, priority, callback, remaining: Some(AtomicU64::new(1)) });
         Ok(id)
     }
 
-    #[pyo3(signature = (callback, times, weak=false))]
-    fn connect_finite(&self, py: Python<'_>, callback: Py<PyAny>, times: u64, weak: bool) -> PyResult<u64> {
+    #[pyo3(signature = (callback, times, weak=false, priority=0))]
+    fn connect_finite(&self, py: Python<'_>, callback: Py<PyAny>, times: u64, weak: bool, priority: i32) -> PyResult<u64> {
         if !callback.bind(py).is_callable() {
             return Err(PyTypeError::new_err("Callback must be a function."));
         }
@@ -211,7 +222,7 @@ impl Signal {
             Callback::Strong(callback)
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.callbacks.write().push(CallbackEntry { id, callback, remaining: Some(AtomicU64::new(times)) });
+        insert_sorted(&mut self.callbacks.write(), CallbackEntry { id, priority, callback, remaining: Some(AtomicU64::new(times)) });
         Ok(id)
     }
 
@@ -222,9 +233,15 @@ impl Signal {
         Ok(guard.len() != before)
     }
 
-    #[pyo3(signature = (callback, weak=false))]
-    fn connected(slf: Py<Self>, py: Python<'_>, callback: Py<PyAny>, weak: bool) -> PyResult<SignalConnection> {
-        let id = slf.borrow(py).connect(py, callback, weak)?;
+    #[pyo3(signature = (callback, weak=false, priority=0))]
+    fn connected(
+        slf: Py<Self>,
+        py: Python<'_>,
+        callback: Py<PyAny>,
+        weak: bool,
+        priority: i32,
+    ) -> PyResult<SignalConnection> {
+        let id = slf.borrow(py).connect(py, callback, weak, priority)?;
         Ok(SignalConnection { signal: slf, id })
     }
 
@@ -241,8 +258,7 @@ impl Signal {
         }
 
         let mut dead_ids = HashSet::new();
-        let mut snapshot = Vec::new();
-        let mut weak_pending: Vec<(u64, Py<PyAny>)> = Vec::new();
+        let mut pending = Vec::new();
 
         let guard = self.callbacks.read();
         for entry in guard.iter() {
@@ -259,18 +275,24 @@ impl Signal {
                 }
             }
             match &entry.callback {
-                Callback::Strong(callback) => snapshot.push(callback.clone_ref(py)),
-                Callback::Weak(weakref_obj) => weak_pending.push((entry.id, weakref_obj.clone_ref(py))),
+                Callback::Strong(callback) => pending.push(PendingCallback::Resolved(callback.clone_ref(py))),
+                Callback::Weak(weakref_obj) => pending.push(PendingCallback::Weak(entry.id, weakref_obj.clone_ref(py))),
             }
         }
         drop(guard);
 
-        for (id, weakref_obj) in weak_pending {
-            let referent = weakref_obj.call0(py)?;
-            if referent.is_none(py) {
-                dead_ids.insert(id);
-            } else {
-                snapshot.push(referent);
+        let mut snapshot = Vec::with_capacity(pending.len());
+        for item in pending {
+            match item {
+                PendingCallback::Resolved(callback) => snapshot.push(callback),
+                PendingCallback::Weak(id, weakref_obj) => {
+                    let referent = weakref_obj.call0(py)?;
+                    if referent.is_none(py) {
+                        dead_ids.insert(id);
+                    } else {
+                        snapshot.push(referent);
+                    }
+                }
             }
         }
 
@@ -304,8 +326,7 @@ impl Signal {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
         let mut dead_ids = HashSet::new();
-        let mut snapshot = Vec::new();
-        let mut weak_pending: Vec<(u64, Py<PyAny>)> = Vec::new();
+        let mut pending = Vec::new();
 
         let guard = self.callbacks.read();
         for entry in guard.iter() {
@@ -322,18 +343,24 @@ impl Signal {
                 }
             }
             match &entry.callback {
-                Callback::Strong(callback) => snapshot.push(callback.clone_ref(py)),
-                Callback::Weak(weakref_obj) => weak_pending.push((entry.id, weakref_obj.clone_ref(py))),
+                Callback::Strong(callback) => pending.push(PendingCallback::Resolved(callback.clone_ref(py))),
+                Callback::Weak(weakref_obj) => pending.push(PendingCallback::Weak(entry.id, weakref_obj.clone_ref(py))),
             }
         }
         drop(guard);
 
-        for (id, weakref_obj) in weak_pending {
-            let referent = weakref_obj.call0(py)?;
-            if referent.is_none(py) {
-                dead_ids.insert(id);
-            } else {
-                snapshot.push(referent);
+        let mut snapshot = Vec::with_capacity(pending.len());
+        for item in pending {
+            match item {
+                PendingCallback::Resolved(callback) => snapshot.push(callback),
+                PendingCallback::Weak(id, weakref_obj) => {
+                    let referent = weakref_obj.call0(py)?;
+                    if referent.is_none(py) {
+                        dead_ids.insert(id);
+                    } else {
+                        snapshot.push(referent);
+                    }
+                }
             }
         }
 
