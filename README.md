@@ -4,6 +4,7 @@
 ![PyO3](https://img.shields.io/badge/PyO3-extension-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?logo=python)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![PyPI](https://img.shields.io/badge/pypi-dust--riven-blue?logo=pypi)](https://pypi.org/project/dust-riven/)
 
 Dust Riven is a small Rust extension for Python, built with [PyO3](https://pyo3.rs/). It provides a `Signal` class, a simple event system similar to observer/pub-sub patterns. You create a `Signal`, connect callbacks to it, and `emit` it with arguments to call all connected callbacks.
 
@@ -15,6 +16,8 @@ Dust Riven is a small Rust extension for Python, built with [PyO3](https://pyo3.
 - one-time connections
 - connections that expire after a fixed number of calls
 - weak references, so a callback can be garbage collected without needing to manually disconnect it
+- priority ordering, so higher-priority callbacks run before lower-priority ones
+- scoped connections via a context manager, so a callback is automatically disconnected when the `with` block exits
 
 ## Basic usage
 
@@ -27,10 +30,11 @@ signal = dust_riven.Signal("on_update")
 `name` is optional and defaults to `None` - `dust_riven.Signal()` works just as well as `dust_riven.Signal("on_update")`. Naming a signal is mainly useful for `repr(signal)`, which is handy in logs and debuggers when a program has many signals.
 
 - `Signal(name=None)` - creates a new signal, optionally with a name
-- `connect(callback, weak=False)` - registers a callback, returns an id used to disconnect it later
-- `connect_once(callback, weak=False)` - callback runs on the first emit only
-- `connect_finite(callback, times, weak=False)` - callback runs for a fixed number of emits, then is removed
+- `connect(callback, weak=False, priority=0)` - registers a callback, returns an id used to disconnect it later. Higher `priority` values run first; callbacks with equal priority run in the order they were connected.
+- `connect_once(callback, weak=False, priority=0)` - callback runs on the first emit only
+- `connect_finite(callback, times, weak=False, priority=0)` - callback runs for a fixed number of emits, then is removed
 - `disconnect(id)` - removes a specific callback
+- `connected(callback, weak=False, priority=0)` - like `connect`, but returns a context manager instead of an id. The callback is automatically disconnected when the `with` block exits, even if an exception is raised inside it.
 - `emit(*args, on_error="fast_fail", **kwargs)` - calls all connected callbacks with the given arguments. With `on_error="fast_fail"` (default), the first exception raised stops execution and propagates immediately, and remaining callbacks are not called. With `on_error="collect"`, every callback runs regardless of exceptions; the returned list contains each callback's return value, or the exception instance itself in place of a return value for any callback that raised.
 - `emit_async(*args, **kwargs)` - like `emit`, but if a callback returns an awaitable (e.g. it's an `async def`), those are collected and run concurrently with `asyncio.gather`; must be awaited
 - `len(signal)` - number of callbacks currently connected
@@ -140,6 +144,35 @@ cb_id = signal.connect(handler)
 signal.disconnect(cb_id)
 ```
 
+### Priority ordering
+
+```python
+def logs_first(message):
+    print("log:", message)
+
+def runs_after(message):
+    print("handle:", message)
+
+signal.connect(runs_after, priority=0)
+signal.connect(logs_first, priority=10)
+
+signal.emit("hello")
+# prints "log: hello" then "handle: hello"
+```
+
+### Scoped connection
+
+```python
+def handler(message):
+    print("got:", message)
+
+with signal.connected(handler):
+    signal.emit("hello")  # handler runs
+# handler is automatically disconnected here, even if emit raised
+
+signal.emit("hello")  # handler no longer runs
+```
+
 ### Listener count
 
 ```python
@@ -149,6 +182,8 @@ print(len(signal))
 ## Behavior notes
 
 - Callbacks are collected into a snapshot before being called, so connecting or disconnecting callbacks from inside another callback during `emit` is safe.
+- Callbacks run in priority order (highest first); callbacks connected with equal priority (the default is `0` for all) run in the order they were connected, so existing code that doesn't pass `priority` keeps its original FIFO ordering.
+- `connected()` returns a context manager rather than an id. It's equivalent to calling `connect()` and then `disconnect()` yourself in a `finally` block - useful for listeners that should only be active for the duration of a single operation or test.
 - If a weakly referenced callback has already been garbage collected, it is silently removed the next time `emit` runs.
 - Callbacks connected with `connect_once` or `connect_finite` are automatically removed once they've been called the requested number of times.
 - By default, `emit` uses `on_error="fast_fail"`: the first exception raised by a callback propagates immediately and any callbacks after it are skipped. With `on_error="collect"`, all callbacks run no matter what, and exceptions are returned in the result list rather than raised.
