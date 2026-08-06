@@ -443,8 +443,6 @@ def test_connect_finite_coexists_with_connect_once_and_regular():
     assert len(sig) == 1
 
 
-# --- weak footgun ---
-
 def test_connect_weak_rejects_orphan_bound_method():
     sig = dust_riven.Signal("s")
     class Handler:
@@ -610,8 +608,6 @@ def test_emit_invalid_on_error_does_not_call_listeners():
         sig.emit(on_error="whatever")
     assert calls == []
 
-
-# --- emit_async ---
 
 def test_emit_async_with_no_listeners_does_nothing():
     sig = dust_riven.Signal("s")
@@ -1089,3 +1085,193 @@ def test_emit_async_priority_affects_start_order_of_async_listeners():
 
     asyncio.run(run())
     assert order.index("high-start") < order.index("low-start")
+
+
+def test_emit_async_rejects_invalid_on_error():
+    sig = dust_riven.Signal("s")
+    sig.connect(lambda: None)
+
+    async def run():
+        await sig.emit_async(on_error="whatever")
+
+    with pytest.raises(TypeError):
+        asyncio.run(run())
+
+
+def test_emit_async_invalid_on_error_does_not_call_listeners():
+    calls = []
+    sig = dust_riven.Signal("s")
+    sig.connect(lambda: calls.append(1))
+
+    async def run():
+        await sig.emit_async(on_error="whatever")
+
+    with pytest.raises(TypeError):
+        asyncio.run(run())
+    assert calls == []
+
+
+def test_emit_async_default_on_error_is_fast_fail():
+    sig = dust_riven.Signal("s")
+
+    async def bad():
+        raise ValueError("boom")
+
+    sig.connect(bad)
+
+    async def run():
+        await sig.emit_async()
+
+    with pytest.raises(ValueError):
+        asyncio.run(run())
+
+
+def test_emit_async_collect_does_not_raise_from_async_listener():
+    sig = dust_riven.Signal("s")
+
+    async def bad():
+        raise ValueError("boom")
+
+    sig.connect(bad)
+
+    async def run():
+        return await sig.emit_async(on_error="collect")
+
+    results = asyncio.run(run())
+    assert isinstance(results[0], ValueError)
+
+
+def test_emit_async_collect_does_not_raise_from_sync_listener():
+    sig = dust_riven.Signal("s")
+
+    def bad():
+        raise RuntimeError("boom")
+
+    sig.connect(bad)
+
+    async def run():
+        return await sig.emit_async(on_error="collect")
+
+    results = asyncio.run(run())
+    assert isinstance(results[0], RuntimeError)
+
+
+def test_emit_async_collect_continues_after_sync_exception():
+    calls = []
+    sig = dust_riven.Signal("s")
+
+    def bad():
+        raise RuntimeError("boom")
+
+    async def good():
+        calls.append("good")
+
+    sig.connect(bad)
+    sig.connect(good)
+
+    async def run():
+        return await sig.emit_async(on_error="collect")
+
+    results = asyncio.run(run())
+    assert calls == ["good"]
+    assert isinstance(results[0], RuntimeError)
+    assert results[1] is None
+
+
+def test_emit_async_collect_continues_after_async_exception():
+    calls = []
+    sig = dust_riven.Signal("s")
+
+    async def bad():
+        raise ValueError("boom")
+
+    async def good():
+        calls.append("good")
+
+    sig.connect(bad)
+    sig.connect(good)
+
+    async def run():
+        return await sig.emit_async(on_error="collect")
+
+    results = asyncio.run(run())
+    assert calls == ["good"]
+    assert isinstance(results[0], ValueError)
+    assert results[1] is None
+
+
+def test_emit_async_collect_preserves_call_order_in_results():
+    sig = dust_riven.Signal("s")
+
+    def sync_ok():
+        return "sync"
+
+    async def async_ok():
+        return "async"
+
+    def sync_bad():
+        raise RuntimeError("sync-boom")
+
+    async def async_bad():
+        raise ValueError("async-boom")
+
+    sig.connect(sync_ok, priority=30)
+    sig.connect(async_ok, priority=20)
+    sig.connect(sync_bad, priority=10)
+    sig.connect(async_bad, priority=0)
+
+    async def run():
+        return await sig.emit_async(on_error="collect")
+
+    results = asyncio.run(run())
+    assert results[0] == "sync"
+    assert results[1] == "async"
+    assert isinstance(results[2], RuntimeError)
+    assert isinstance(results[3], ValueError)
+
+
+def test_emit_async_fast_fail_still_stops_before_later_listeners_run():
+    calls = []
+    sig = dust_riven.Signal("s")
+
+    async def first():
+        calls.append("first")
+
+    async def bad():
+        raise ValueError("boom")
+
+    sig.connect(first, priority=10)
+    sig.connect(bad, priority=0)
+
+    async def run():
+        await sig.emit_async()
+
+    with pytest.raises(ValueError):
+        asyncio.run(run())
+    assert calls == ["first"]
+
+
+def test_emit_async_collect_returns_sync_return_values():
+    sig = dust_riven.Signal("s")
+    sig.connect(lambda: "hello")
+
+    async def run():
+        return await sig.emit_async(on_error="collect")
+
+    results = asyncio.run(run())
+    assert results == ["hello"]
+
+
+def test_emit_async_collect_returns_awaited_values():
+    sig = dust_riven.Signal("s")
+
+    async def handler():
+        return "value"
+
+    sig.connect(handler)
+
+    async def run():
+        return await sig.emit_async(on_error="collect")
+
+    results = asyncio.run(run())
+    assert results == ["value"]

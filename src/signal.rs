@@ -20,19 +20,19 @@ pub(crate) struct Signal {
     callbacks: RwLock<SmallVec<[CallbackEntry; 4]>>,
     weakref_mod: OnceCell<Py<PyModule>>,
     asyncio_mod: OnceCell<Py<PyModule>>,
-    immediate_fn: OnceCell<Py<PyAny>>,
+    finalize_fn: OnceCell<Py<PyAny>>,
 }
 
 impl Signal {
-    fn get_immediate_fn(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let f = self.immediate_fn.get_or_try_init(|| -> PyResult<Py<PyAny>> {
+    fn get_finalize_fn(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let f = self.finalize_fn.get_or_try_init(|| -> PyResult<Py<PyAny>> {
             let module = PyModule::from_code(
                 py,
-                c"async def _dust_riven_immediate(value):\n    return value\n",
+                c"import asyncio\n\nasync def _dust_riven_finalize(results, positions, awaitables, fast_fail):\n    gathered = await asyncio.gather(*awaitables, return_exceptions=True)\n    for pos, value in zip(positions, gathered):\n        if fast_fail and isinstance(value, BaseException):\n            raise value\n        results[pos] = value\n    return results\n",
                 c"dust_riven_internal.py",
                 c"dust_riven_internal",
             )?;
-            let func = module.getattr("_dust_riven_immediate")?;
+            let func = module.getattr("_dust_riven_finalize")?;
             Ok(func.unbind())
         })?;
         Ok(f.clone_ref(py))
@@ -57,7 +57,7 @@ impl Signal {
             callbacks: RwLock::new(SmallVec::new()),
             weakref_mod: OnceCell::new(),
             asyncio_mod: OnceCell::new(),
-            immediate_fn: OnceCell::new(),
+            finalize_fn: OnceCell::new(),
         }
     }
 
@@ -261,13 +261,19 @@ impl Signal {
         Ok(pyo3::types::PyList::new(py, results)?.unbind().into())
     }
 
-    #[pyo3(signature = (*args, **kwargs))]
+    #[pyo3(signature = (*args, on_error="fast_fail", **kwargs))]
     fn emit_async(
         &self,
         py: Python<'_>,
         args: &Bound<'_, PyTuple>,
+        on_error: &str,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
+        if on_error != "fast_fail" && on_error != "collect" {
+            return Err(PyTypeError::new_err("on_error must be 'fast_fail' or 'collect'."));
+        }
+        let fast_fail = on_error == "fast_fail";
+
         let mut dead_ids = HashSet::new();
         let mut pending = Vec::new();
 
@@ -308,43 +314,49 @@ impl Signal {
         }
 
         if !dead_ids.is_empty() {
-            self.callbacks
-                .write()
-                .retain(|entry| !dead_ids.contains(&entry.id));
+            self.callbacks.write().retain(|entry| !dead_ids.contains(&entry.id));
         }
 
-        let mut awaitables: Vec<Py<PyAny>> = Vec::with_capacity(snapshot.len());
+        let mut results: Vec<Py<PyAny>> = Vec::with_capacity(snapshot.len());
+        let mut awaitables: Vec<Py<PyAny>> = Vec::new();
+        let mut positions: Vec<usize> = Vec::new();
+
         for callback in snapshot {
-            let result = match callback.call(py, args, kwargs) {
-                Ok(result) => result,
-                Err(e) => {
-                    for obj in awaitables {
-                        let bound = obj.bind(py);
-                        if bound.hasattr("close")? {
-                            let _ = bound.call_method0("close");
-                        }
+            let index = results.len();
+            match callback.call(py, args, kwargs) {
+                Ok(result) => {
+                    if result.bind(py).hasattr("__await__")? {
+                        results.push(py.None());
+                        awaitables.push(result);
+                        positions.push(index);
+                    } else {
+                        results.push(result);
                     }
-                    return Err(e);
                 }
-            };
-            if result.bind(py).hasattr("__await__")? {
-                awaitables.push(result);
+                Err(e) => {
+                    if fast_fail {
+                        for obj in awaitables {
+                            let bound = obj.bind(py);
+                            if bound.hasattr("close")? {
+                                let _ = bound.call_method0("close");
+                            }
+                        }
+                        return Err(e);
+                    }
+                    results.push(e.value(py).clone().unbind().into());
+                }
             }
         }
 
         let asyncio = self.get_asyncio(py)?;
         asyncio.bind(py).call_method0("get_running_loop")?;
 
-        if awaitables.is_empty() {
-            let immediate = self.get_immediate_fn(py)?;
-            let empty_list = pyo3::types::PyList::empty(py);
-            let coro = immediate.bind(py).call1((empty_list,))?;
-            return Ok(coro.unbind());
-        }
-
+        let finalize = self.get_finalize_fn(py)?;
+        let results_list = pyo3::types::PyList::new(py, results)?;
+        let positions_list = pyo3::types::PyList::new(py, positions)?;
         let awaitables_tuple = pyo3::types::PyTuple::new(py, awaitables)?;
-        let gathered = asyncio.bind(py).call_method1("gather", awaitables_tuple)?;
-        Ok(gathered.unbind())
+        let coro = finalize.bind(py).call1((results_list, positions_list, awaitables_tuple, fast_fail))?;
+        Ok(coro.unbind())
     }
 
     fn __traverse__(&self, visit: pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
@@ -356,7 +368,7 @@ impl Signal {
             }
         }
         drop(guard);
-        if let Some(f) = self.immediate_fn.get() {
+        if let Some(f) = self.finalize_fn.get() {
             visit.call(f)?;
         }
         Ok(())
