@@ -831,7 +831,10 @@ def test_emit_async_after_regular_emit_still_works():
 
     sig.connect(lambda: calls.append("sync"))
     sig.connect(handler)
-    sig.emit()
+    results = sig.emit()
+    for result in results:
+        if hasattr(result, "close"):
+            result.close()
 
     async def run():
         await sig.emit_async()
