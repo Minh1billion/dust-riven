@@ -18,6 +18,7 @@ pub(crate) struct Signal {
     name: Option<String>,
     next_id: AtomicU64,
     callbacks: RwLock<SmallVec<[CallbackEntry; 4]>>,
+    error_hooks: RwLock<Vec<Py<PyAny>>>,
     weakref_mod: OnceCell<Py<PyModule>>,
     asyncio_mod: OnceCell<Py<PyModule>>,
     finalize_fn: OnceCell<Py<PyAny>>,
@@ -44,6 +45,23 @@ impl Signal {
             .get_or_try_init(|| py.import("asyncio").map(|m| m.unbind()))?;
         Ok(m.clone_ref(py))
     }
+
+    /// Invoke every registered error hook with (exception, callback).
+    /// Hooks are best-effort observers: if a hook itself raises, we don't let
+    /// that interrupt emit()/emit_async() or mask the original error - we
+    /// print it (like an unraisable exception) and move on to the next hook.
+    fn notify_error_hooks(&self, py: Python<'_>, err: &PyErr, callback: &Py<PyAny>) {
+        let hooks = self.error_hooks.read();
+        if hooks.is_empty() {
+            return;
+        }
+        let exc_obj: Py<PyAny> = err.value(py).clone().unbind().into();
+        for hook in hooks.iter() {
+            if let Err(hook_err) = hook.call1(py, (exc_obj.clone_ref(py), callback.clone_ref(py))) {
+                hook_err.print(py);
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -55,10 +73,31 @@ impl Signal {
             name,
             next_id: AtomicU64::new(0),
             callbacks: RwLock::new(SmallVec::new()),
+            error_hooks: RwLock::new(Vec::new()),
             weakref_mod: OnceCell::new(),
             asyncio_mod: OnceCell::new(),
             finalize_fn: OnceCell::new(),
         }
+    }
+
+    /// Register a hook called as `hook(exception, callback)` whenever a
+    /// connected callback raises during `emit()` or `emit_async()`, regardless
+    /// of `on_error` mode. Independent of `emit(on_error=...)`: hooks always
+    /// see the error, `on_error` only controls whether emit() also re-raises
+    /// or continues. Useful for centralized logging/metrics without changing
+    /// every call site.
+    #[pyo3(signature = (handler))]
+    fn on_error(&self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<()> {
+        if !handler.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("Error handler must be a function."));
+        }
+        self.error_hooks.write().push(handler);
+        Ok(())
+    }
+
+    /// Remove all registered error hooks.
+    fn clear_error_hooks(&self) {
+        self.error_hooks.write().clear();
     }
 
     #[pyo3(signature = (callback, weak=false, priority=0))]
@@ -250,6 +289,7 @@ impl Signal {
             match callback.call(py, args, kwargs) {
                 Ok(result) => results.push(result),
                 Err(e) => {
+                    self.notify_error_hooks(py, &e, &callback);
                     if on_error == "fast_fail" {
                         return Err(e);
                     }
@@ -334,6 +374,7 @@ impl Signal {
                     }
                 }
                 Err(e) => {
+                    self.notify_error_hooks(py, &e, &callback);
                     if fast_fail {
                         for obj in awaitables {
                             let bound = obj.bind(py);
@@ -349,7 +390,20 @@ impl Signal {
         }
 
         let asyncio = self.get_asyncio(py)?;
-        asyncio.bind(py).call_method0("get_running_loop")?;
+        if let Err(e) = asyncio.bind(py).call_method0("get_running_loop") {
+            // Edge case fix: if there's no running loop, any async callback's
+            // coroutine created above (in the loop right before this check)
+            // would otherwise never be awaited or closed, leaking it and
+            // triggering "coroutine was never awaited" warnings. Close them
+            // the same way the fast_fail path above already does.
+            for obj in awaitables {
+                let bound = obj.bind(py);
+                if bound.hasattr("close")? {
+                    let _ = bound.call_method0("close");
+                }
+            }
+            return Err(e);
+        }
 
         let finalize = self.get_finalize_fn(py)?;
         let results_list = pyo3::types::PyList::new(py, results)?;
@@ -368,6 +422,11 @@ impl Signal {
             }
         }
         drop(guard);
+        let hooks = self.error_hooks.read();
+        for hook in hooks.iter() {
+            visit.call(hook)?;
+        }
+        drop(hooks);
         if let Some(f) = self.finalize_fn.get() {
             visit.call(f)?;
         }
@@ -376,6 +435,7 @@ impl Signal {
 
     fn __clear__(&self) {
         self.callbacks.write().clear();
+        self.error_hooks.write().clear();
     }
 
     fn __len__(&self) -> usize {

@@ -1278,3 +1278,175 @@ def test_emit_async_collect_returns_awaited_values():
 
     results = asyncio.run(run())
     assert results == ["value"]
+
+# --- on_error hook ---
+
+def test_on_error_hook_fires_on_emit_failure_fast_fail():
+    sig = dust_riven.Signal("s")
+    seen = []
+
+    def hook(exc, callback):
+        seen.append((type(exc), exc.args, callback))
+
+    def boom():
+        raise ValueError("bad listener")
+
+    sig.on_error(hook)
+    sig.connect(boom)
+
+    with pytest.raises(ValueError):
+        sig.emit()
+
+    assert len(seen) == 1
+    assert seen[0][0] is ValueError
+    assert seen[0][1] == ("bad listener",)
+    assert seen[0][2] is boom
+
+
+def test_on_error_hook_fires_on_emit_failure_collect_mode():
+    sig = dust_riven.Signal("s")
+    seen = []
+
+    def hook(exc, callback):
+        seen.append(exc)
+
+    def boom():
+        raise ValueError("bad listener")
+
+    sig.on_error(hook)
+    sig.connect(boom)
+
+    results = sig.emit(on_error="collect")
+
+    assert len(seen) == 1
+    assert isinstance(results[0], ValueError)
+
+
+def test_on_error_hook_does_not_fire_on_success():
+    sig = dust_riven.Signal("s")
+    seen = []
+    sig.on_error(lambda exc, cb: seen.append(exc))
+    sig.connect(lambda: "ok")
+
+    sig.emit()
+
+    assert seen == []
+
+
+def test_on_error_hook_runs_for_every_failing_callback():
+    sig = dust_riven.Signal("s")
+    seen = []
+    sig.on_error(lambda exc, cb: seen.append(cb))
+
+    def boom():
+        raise ValueError("boom")
+
+    sig.connect(boom)
+    sig.connect(boom)
+
+    sig.emit(on_error="collect")
+
+    assert seen == [boom, boom]
+
+
+def test_multiple_error_hooks_all_run():
+    sig = dust_riven.Signal("s")
+    calls = []
+    sig.on_error(lambda exc, cb: calls.append("first"))
+    sig.on_error(lambda exc, cb: calls.append("second"))
+
+    def boom():
+        raise ValueError("boom")
+
+    sig.connect(boom)
+    sig.emit(on_error="collect")
+
+    assert calls == ["first", "second"]
+
+
+def test_broken_error_hook_does_not_block_other_hooks_or_emit():
+    sig = dust_riven.Signal("s")
+    calls = []
+
+    def broken_hook(exc, cb):
+        raise RuntimeError("hook itself is broken")
+
+    def working_hook(exc, cb):
+        calls.append("worked")
+
+    sig.on_error(broken_hook)
+    sig.on_error(working_hook)
+
+    def boom():
+        raise ValueError("boom")
+
+    sig.connect(boom)
+    # emit() must still behave normally: collect mode still returns the
+    # original ValueError, a broken hook must not mask or replace it.
+    results = sig.emit(on_error="collect")
+
+    assert calls == ["worked"]
+    assert isinstance(results[0], ValueError)
+
+
+def test_clear_error_hooks_removes_all_hooks():
+    sig = dust_riven.Signal("s")
+    seen = []
+    sig.on_error(lambda exc, cb: seen.append(exc))
+    sig.clear_error_hooks()
+
+    def boom():
+        raise ValueError("boom")
+
+    sig.connect(boom)
+    sig.emit(on_error="collect")
+
+    assert seen == []
+
+
+def test_on_error_rejects_non_callable():
+    sig = dust_riven.Signal("s")
+    with pytest.raises(TypeError):
+        sig.on_error("not callable")
+
+
+def test_on_error_hook_fires_for_emit_async_sync_callback_failure():
+    sig = dust_riven.Signal("s")
+    seen = []
+    sig.on_error(lambda exc, cb: seen.append(exc))
+
+    def boom():
+        raise ValueError("boom")
+
+    sig.connect(boom)
+
+    async def run():
+        return await sig.emit_async(on_error="collect")
+
+    results = asyncio.run(run())
+
+    assert len(seen) == 1
+    assert isinstance(results[0], ValueError)
+
+
+# --- emit_async: no running loop must not leak coroutines ---
+
+def test_emit_async_without_running_loop_raises_and_does_not_leak(recwarn):
+    sig = dust_riven.Signal("s")
+
+    async def async_handler():
+        return "value"
+
+    sig.connect(async_handler)
+
+    with pytest.raises(RuntimeError):
+        sig.emit_async()  # called synchronously, no loop is running here
+
+    import gc
+    gc.collect()
+
+    leaked = [
+        w for w in recwarn.list
+        if "coroutine" in str(w.message) and "never awaited" in str(w.message)
+    ]
+    assert leaked == [], f"expected no leaked-coroutine warnings, got: {leaked}"
