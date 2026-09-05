@@ -55,7 +55,7 @@ impl Signal {
         if hooks.is_empty() {
             return;
         }
-        let exc_obj: Py<PyAny> = err.value(py).clone().unbind();
+        let exc_obj: Py<PyAny> = err.value(py).clone().unbind().into();
         for hook in hooks.iter() {
             if let Err(hook_err) = hook.call1(py, (exc_obj.clone_ref(py), callback.clone_ref(py))) {
                 hook_err.print(py);
