@@ -37,6 +37,8 @@ signal = dust_riven.Signal("on_update")
 - `connected(callback, weak=False, priority=0)` - like `connect`, but returns a context manager instead of an id. The callback is automatically disconnected when the `with` block exits, even if an exception is raised inside it.
 - `emit(*args, on_error="fast_fail", **kwargs)` - calls all connected callbacks with the given arguments. With `on_error="fast_fail"` (default), the first exception raised stops execution and propagates immediately, and remaining callbacks are not called. With `on_error="collect"`, every callback runs regardless of exceptions; the returned list contains each callback's return value, or the exception instance itself in place of a return value for any callback that raised.
 - `emit_async(*args, **kwargs)` - like `emit`, but if a callback returns an awaitable (e.g. it's an `async def`), those are collected and run concurrently with `asyncio.gather`; must be awaited
+- `on_error(handler)` - registers `handler(exception, callback)`, called every time any connected callback raises during `emit()` or `emit_async()`, regardless of `on_error=` mode. Independent of `emit(on_error=...)`: hooks always observe the error, `on_error=` only controls whether `emit()`/`emit_async()` also re-raises (`fast_fail`) or continues and collects it (`collect`). Meant for centralized logging/metrics without touching every call site. If a hook itself raises, that error is printed (not propagated) and the remaining hooks still run.
+- `clear_error_hooks()` - removes all hooks registered via `on_error`
 - `len(signal)` - number of callbacks currently connected
 
 Pass `weak=True` on any connect method to hold a weak reference instead of a strong one, so the callback can be garbage collected normally if nothing else references it. If the callback has no other strong reference at the time you connect it (so it would be garbage collected immediately), the connect call raises `TypeError` instead of silently connecting a listener that can never fire.
@@ -95,6 +97,24 @@ signal.connect(boom)
 
 results = signal.emit(on_error="collect")
 # results == ["fine", ValueError("bad listener")]
+```
+
+### Centralized error logging with on_error
+
+```python
+def log_listener_error(exc, callback):
+    print(f"listener {callback!r} failed: {exc!r}")
+
+signal.on_error(log_listener_error)
+
+def boom():
+    raise ValueError("bad listener")
+
+signal.connect(boom)
+
+# Hook fires no matter which on_error mode you pick:
+signal.emit(on_error="collect")     # hook fires, emit() also returns [ValueError(...)]
+signal.emit(on_error="fast_fail")   # hook fires, then emit() re-raises ValueError
 ```
 
 ### Async emit
@@ -190,8 +210,9 @@ print(len(signal))
 - `emit_async` calls every callback the same way `emit` does; any callback that returns an awaitable (e.g. an `async def`) has that awaitable scheduled via `asyncio.gather` and run concurrently once you `await` the result. Purely synchronous callbacks run immediately, before the returned value is awaited.
 - `emit_async` must be called from a thread with an already-running `asyncio` event loop (i.e. `await signal.emit_async()` from inside a coroutine) - this applies even if every connected callback is synchronous. Calling it with no loop running (e.g. `asyncio.run(signal.emit_async())`, where the call happens before `run` starts its loop) raises `RuntimeError`.
 - With `emit_async`, an exception from a synchronous callback is raised as soon as it's called (before you even reach the `await`), while an exception from an async callback surfaces when the gathered result is awaited.
-- If a callback raises during `emit_async`, remaining callbacks are not called, and any async callback's coroutine already created before the error is closed rather than left dangling.
-- `Signal` participates in Python's cyclic garbage collector, so a callback that holds a reference back to its own `Signal` (e.g. a closure or bound method capturing the signal it's connected to) doesn't leak - `gc.collect()` can still find and break that cycle even though nothing was ever explicitly disconnected.
+- If a callback raises during `emit_async`, remaining callbacks are not called, and any async callback's coroutine already created before the error is closed rather than left dangling. The same cleanup also happens if `emit_async` is called with no running event loop: any coroutines already created from earlier async callbacks are closed before the `RuntimeError` propagates, instead of being left as unawaited, leaked coroutines.
+- `on_error` hooks run for every callback failure in both `emit` and `emit_async`, independently of `on_error="fast_fail"`/`"collect"`. They're observers, not error handlers: they can't suppress or transform the error, and if a hook itself raises, that's printed rather than propagated so one broken hook can't block emit or other hooks.
+- `Signal` participates in Python's cyclic garbage collector, so a callback that holds a reference back to its own `Signal` (e.g. a closure or bound method capturing the signal it's connected to) doesn't leak - `gc.collect()` can still find and break that cycle even though nothing was ever explicitly disconnected. This also applies to hooks registered via `on_error`.
 
 ## Building
 
